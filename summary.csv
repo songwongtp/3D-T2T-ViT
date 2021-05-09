@@ -1,0 +1,12 @@
+epoch,train_loss,eval_loss,eval_top1,eval_top5
+0,0.7778084843586652,0.7216867208480835,45.0,100.0
+epoch,train_loss,eval_loss,eval_top1,eval_top5
+0,0.7778084843586652,0.7216867208480835,45.0,100.0
+epoch,train_loss,eval_loss,eval_top1,eval_top5
+0,0.7778084843586652,0.7216867208480835,45.0,100.0
+epoch,train_loss,eval_loss,eval_top1,eval_top5
+1,0.8156446371323023,0.7214539051055908,45.0,100.0
+epoch,train_loss,eval_loss,eval_top1,eval_top5
+1,0.8156446371323023,0.7214539051055908,45.0,100.0
+epoch,train_loss,eval_loss,eval_top1,eval_top5
+1,0.8156446371323023,0.7214539051055908,45.0,100.0

@@ -22,15 +22,22 @@ import models
 import torch
 import torch.nn as nn
 import torchvision.utils
+from torch.utils.data import DataLoader
 from torch.nn.parallel import DistributedDataParallel as NativeDDP
+from torchvision import transforms
 
 from timm.data import Dataset, create_loader, resolve_data_config, Mixup, FastCollateMixup, AugMixDataset
+from timm.data.distributed_sampler import OrderedDistributedSampler
+from timm.data.mixup import one_hot
 from timm.models import load_checkpoint, create_model, resume_checkpoint, convert_splitbn_model
 from timm.utils import *
 from timm.loss import LabelSmoothingCrossEntropy, SoftTargetCrossEntropy, JsdCrossEntropy
 from timm.optim import create_optimizer
 from timm.scheduler import create_scheduler
 from timm.utils import ApexScaler, NativeScaler
+
+from datasets.adni_dataset import ADNIDataset
+from datasets.adni_transforms import ToTensor
 
 torch.backends.cudnn.benchmark = True
 _logger = logging.getLogger('train')
@@ -58,12 +65,13 @@ parser.add_argument('--eval_checkpoint', default='', type=str, metavar='PATH',
                     help='path to eval checkpoint (default: none)')
 parser.add_argument('--no-resume-opt', action='store_true', default=False,
                     help='prevent resume of optimizer state when resuming model')
-parser.add_argument('--num-classes', type=int, default=1000, metavar='N',
+parser.add_argument('--num-classes', type=int, default=2, metavar='N',
                     help='number of label classes (default: 1000)')
 parser.add_argument('--gp', default=None, type=str, metavar='POOL',
                     help='Global pool type, one of (fast, avg, max, avgmax, avgmaxc). Model default if None.')
-parser.add_argument('--img-size', type=int, default=224, metavar='N',
-                    help='Image patch size (default: None => model default)')
+# hardcoding img-size instead
+# parser.add_argument('--img-size', type=int, default=224, metavar='N',
+#                     help='Image patch size (default: None => model default)')
 parser.add_argument('--crop-pct', default=None, type=float,
                     metavar='N', help='Input image center crop percent (for validation only)')
 parser.add_argument('--mean', type=float, nargs='+', default=None, metavar='MEAN',
@@ -224,7 +232,7 @@ parser.add_argument('--channels-last', action='store_true', default=False,
                     help='Use channels_last memory layout')
 parser.add_argument('--pin-mem', action='store_true', default=False,
                     help='Pin CPU memory in DataLoader for more efficient (sometimes) transfer to GPU.')
-parser.add_argument('--no-prefetcher', action='store_true', default=False,
+parser.add_argument('--no-prefetcher', action='store_true', default=True,
                     help='disable fast prefetcher')
 parser.add_argument('--output', default='', type=str, metavar='PATH',
                     help='path to output folder (default: none, current dir)')
@@ -302,6 +310,7 @@ def main():
 
     torch.manual_seed(args.seed + args.rank)
 
+    args.img_size = (105, 126, 105)
     model = create_model(
         args.model,
         pretrained=args.pretrained,
@@ -320,8 +329,6 @@ def main():
     if args.local_rank == 0:
         _logger.info('Model %s created, param count: %d' %
                      (args.model, sum([m.numel() for m in model.parameters()])))
-
-    data_config = resolve_data_config(vars(args), model=model, verbose=args.local_rank == 0)
 
     num_aug_splits = 0
     if args.aug_splits > 0:
@@ -434,12 +441,7 @@ def main():
     if args.local_rank == 0:
         _logger.info('Scheduled epochs: {}'.format(num_epochs))
 
-    train_dir = os.path.join(args.data, 'train')
-    if not os.path.exists(train_dir):
-        _logger.error('Training folder does not exist at: {}'.format(train_dir))
-        exit(1)
-    dataset_train = Dataset(train_dir)
-
+    
     collate_fn = None
     mixup_fn = None
     mixup_active = args.mixup > 0 or args.cutmix > 0. or args.cutmix_minmax is not None
@@ -453,64 +455,16 @@ def main():
             collate_fn = FastCollateMixup(**mixup_args)
         else:
             mixup_fn = Mixup(**mixup_args)
+            mixup_fn = None
 
-    if num_aug_splits > 1:
-        dataset_train = AugMixDataset(dataset_train, num_splits=num_aug_splits)
+    dataset_train = ADNIDataset(args.data, 'train', transform=transforms.Compose([ToTensor()]))
+    sampler_train = torch.utils.data.distributed.DistributedSampler(dataset_train) if args.distributed else None
+    loader_train = DataLoader(dataset_train, batch_size=args.batch_size, sampler=sampler_train, num_workers=args.workers)
 
-    train_interpolation = args.train_interpolation
-    if args.no_aug or not train_interpolation:
-        train_interpolation = data_config['interpolation']
-    loader_train = create_loader(
-        dataset_train,
-        input_size=data_config['input_size'],
-        batch_size=args.batch_size,
-        is_training=True,
-        use_prefetcher=args.prefetcher,
-        no_aug=args.no_aug,
-        re_prob=args.reprob,
-        re_mode=args.remode,
-        re_count=args.recount,
-        re_split=args.resplit,
-        scale=args.scale,
-        ratio=args.ratio,
-        hflip=args.hflip,
-        vflip=args.vflip,
-        color_jitter=args.color_jitter,
-        auto_augment=args.aa,
-        num_aug_splits=num_aug_splits,
-        interpolation=train_interpolation,
-        mean=data_config['mean'],
-        std=data_config['std'],
-        num_workers=args.workers,
-        distributed=args.distributed,
-        collate_fn=collate_fn,
-        pin_memory=args.pin_mem,
-        use_multi_epochs_loader=args.use_multi_epochs_loader
-    )
-
-    eval_dir = os.path.join(args.data, 'val')
-    if not os.path.isdir(eval_dir):
-        eval_dir = os.path.join(args.data, 'validation')
-        if not os.path.isdir(eval_dir):
-            _logger.error('Validation folder does not exist at: {}'.format(eval_dir))
-            exit(1)
-    dataset_eval = Dataset(eval_dir)
-
-    loader_eval = create_loader(
-        dataset_eval,
-        input_size=data_config['input_size'],
-        batch_size=args.validation_batch_size_multiplier * args.batch_size,
-        is_training=False,
-        use_prefetcher=args.prefetcher,
-        interpolation=data_config['interpolation'],
-        mean=data_config['mean'],
-        std=data_config['std'],
-        num_workers=args.workers,
-        distributed=args.distributed,
-        crop_pct=data_config['crop_pct'],
-        pin_memory=args.pin_mem,
-    )
-
+    dataset_eval = ADNIDataset(args.data, 'val', transform=transforms.Compose([ToTensor()]))
+    sampler_eval = OrderedDistributedSampler(dataset_eval) if args.distributed else None
+    loader_eval = DataLoader(dataset_eval, batch_size=args.batch_size, sampler=sampler_eval, num_workers=args.workers)
+        
     if args.jsd:
         assert num_aug_splits > 1  # JSD only valid with aug splits set
         train_loss_fn = JsdCrossEntropy(num_splits=num_aug_splits, smoothing=args.smoothing).cuda()
@@ -539,8 +493,7 @@ def main():
         output_base = args.output if args.output else './output'
         exp_name = '-'.join([
             datetime.now().strftime("%Y%m%d-%H%M%S"),
-            args.model,
-            str(data_config['input_size'][-1])
+            args.model
         ])
         output_dir = get_outdir(output_base, 'train', exp_name)
         decreasing = True if eval_metric == 'loss' else False
@@ -608,7 +561,7 @@ def train_epoch(
     data_time_m = AverageMeter()
     losses_m = AverageMeter()
     top1_m = AverageMeter()
-    top5_m = AverageMeter()
+    top2_m = AverageMeter()
 
     model.train()
 
@@ -619,7 +572,7 @@ def train_epoch(
         last_batch = batch_idx == last_idx
         data_time_m.update(time.time() - end)
         if not args.prefetcher:
-            input, target = input.cuda(), target.cuda()
+            input, target = input.cuda(), one_hot(target.cuda(), args.num_classes, device='cuda')
             if mixup_fn is not None:
                 input, target = mixup_fn(input, target)
         if args.channels_last:
@@ -648,6 +601,7 @@ def train_epoch(
         num_updates += 1
 
         batch_time_m.update(time.time() - end)
+        batch_mem = torch.cuda.max_memory_allocated() / (1024.0 * 1024.0)
         if last_batch or batch_idx % args.log_interval == 0:
             lrl = [param_group['lr'] for param_group in optimizer.param_groups]
             lr = sum(lrl) / len(lrl)
@@ -662,6 +616,7 @@ def train_epoch(
                     'Loss: {loss.val:>9.6f} ({loss.avg:>6.4f})  '
                     'Time: {batch_time.val:.3f}s, {rate:>7.2f}/s  '
                     '({batch_time.avg:.3f}s, {rate_avg:>7.2f}/s)  '
+                    'Mem: {batch_mem:>5.0f}  '
                     'LR: {lr:.3e}  '
                     'Data: {data_time.val:.3f} ({data_time.avg:.3f})'.format(
                         epoch,
@@ -671,6 +626,7 @@ def train_epoch(
                         batch_time=batch_time_m,
                         rate=input.size(0) * args.world_size / batch_time_m.val,
                         rate_avg=input.size(0) * args.world_size / batch_time_m.avg,
+                        batch_mem=batch_mem,
                         lr=lr,
                         data_time=data_time_m))
 
@@ -701,7 +657,7 @@ def validate(model, loader, loss_fn, args, amp_autocast=suppress, log_suffix='')
     batch_time_m = AverageMeter()
     losses_m = AverageMeter()
     top1_m = AverageMeter()
-    top5_m = AverageMeter()
+    top2_m = AverageMeter()
 
     model.eval()
 
@@ -712,7 +668,7 @@ def validate(model, loader, loss_fn, args, amp_autocast=suppress, log_suffix='')
             last_batch = batch_idx == last_idx
             if not args.prefetcher:
                 input = input.cuda()
-                target = target.cuda()
+                target = target.cuda().long()
             if args.channels_last:
                 input = input.contiguous(memory_format=torch.channels_last)
 
@@ -728,12 +684,12 @@ def validate(model, loader, loss_fn, args, amp_autocast=suppress, log_suffix='')
                 target = target[0:target.size(0):reduce_factor]
 
             loss = loss_fn(output, target)
-            acc1, acc5 = accuracy(output, target, topk=(1, 5))
+            acc1, acc2 = accuracy(output, target, topk=(1,2))
 
             if args.distributed:
                 reduced_loss = reduce_tensor(loss.data, args.world_size)
                 acc1 = reduce_tensor(acc1, args.world_size)
-                acc5 = reduce_tensor(acc5, args.world_size)
+                acc2 = reduce_tensor(acc2, args.world_size)
             else:
                 reduced_loss = loss.data
 
@@ -741,7 +697,7 @@ def validate(model, loader, loss_fn, args, amp_autocast=suppress, log_suffix='')
 
             losses_m.update(reduced_loss.item(), input.size(0))
             top1_m.update(acc1.item(), output.size(0))
-            top5_m.update(acc5.item(), output.size(0))
+            top2_m.update(acc2.item(), output.size(0))
 
             batch_time_m.update(time.time() - end)
             end = time.time()
@@ -752,11 +708,11 @@ def validate(model, loader, loss_fn, args, amp_autocast=suppress, log_suffix='')
                     'Time: {batch_time.val:.3f} ({batch_time.avg:.3f})  '
                     'Loss: {loss.val:>7.4f} ({loss.avg:>6.4f})  '
                     'Acc@1: {top1.val:>7.4f} ({top1.avg:>7.4f})  '
-                    'Acc@5: {top5.val:>7.4f} ({top5.avg:>7.4f})'.format(
+                    'Acc@5: {top2.val:>7.4f} ({top2.avg:>7.4f})'.format(
                         log_name, batch_idx, last_idx, batch_time=batch_time_m,
-                        loss=losses_m, top1=top1_m, top5=top5_m))
+                        loss=losses_m, top1=top1_m, top2=top2_m))
 
-    metrics = OrderedDict([('loss', losses_m.avg), ('top1', top1_m.avg), ('top5', top5_m.avg)])
+    metrics = OrderedDict([('loss', losses_m.avg), ('top1', top1_m.avg), ('top2', top2_m.avg)])
 
     return metrics
 
